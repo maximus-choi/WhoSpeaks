@@ -1,110 +1,515 @@
-from PyQt6.QtWidgets import QApplication, QTextEdit, QMainWindow, QLabel, QVBoxLayout, QWidget, QDoubleSpinBox, QHBoxLayout, QPushButton, QSpacerItem, QSizePolicy
+from PyQt6.QtWidgets import (QApplication, QTextEdit, QMainWindow, QLabel, QVBoxLayout, QWidget, 
+                            QHBoxLayout, QPushButton, QSizePolicy, QGroupBox, QSlider, QSpinBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QEvent, QTimer
-from sklearn.cluster import AgglomerativeClustering, KMeans
-from TTS.tts.models import setup_model as setup_tts_model
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
+from scipy.spatial.distance import cosine
 from RealtimeSTT import AudioToTextRecorder
-from TTS.config import load_config
 import numpy as np
-import pyaudio
+import soundcard as sc
 import queue
 import torch
-import wave
+import time
 import sys
 import os
+import urllib.request
+import torchaudio
 
+# Simplified configuration parameters
 SILENCE_THRESHS = [0, 0.4]
-FINAL_TRANSCRIPTION_MODEL = "large-v2"
+FINAL_TRANSCRIPTION_MODEL = "distil-large-v3"
 FINAL_BEAM_SIZE = 5
 REALTIME_TRANSCRIPTION_MODEL = "distil-small.en"
 REALTIME_BEAM_SIZE = 5
-TRANSCRIPTION_LANGUAGE = "en"
+TRANSCRIPTION_LANGUAGE = "en" # Accuracy in languages ​​other than English is very low.
 SILERO_SENSITIVITY = 0.4
 WEBRTC_SENSITIVITY = 3
 MIN_LENGTH_OF_RECORDING = 0.7
 PRE_RECORDING_BUFFER_DURATION = 0.35
-INIT_TWO_SPEAKER_THRESHOLD = 17
-INIT_SILHOUETTE_DIFF_THRESHOLD = 0.0001
 
+# Speaker change detection parameters
+DEFAULT_CHANGE_THRESHOLD = 0.7  # Threshold for detecting speaker change
+EMBEDDING_HISTORY_SIZE = 5  # Number of embeddings to keep for comparison
+MIN_SEGMENT_DURATION = 1.0  # Minimum duration before considering a speaker change
+DEFAULT_MAX_SPEAKERS = 4  # Default maximum number of speakers
+ABSOLUTE_MAX_SPEAKERS = 10  # Absolute maximum number of speakers allowed
+
+# Global variables
 FAST_SENTENCE_END = True
-USE_MICROPHONE = True
-LOOPBACK_DEVICE_NAME = "stereomix"
-LOOPBACK_DEVICE_HOST_API = 0
-
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
+USE_MICROPHONE = False
 SAMPLE_RATE = 16000
 BUFFER_SIZE = 512
+CHANNELS = 1
 
-
-COLOR_TABLE_HEX = [
-    "#FFFF00",  # yellow
-    "#FF0000",  # red
-    "#00FFFF",  # cyan
-    "#FF00FF",  # magenta
-    "#FFA500",  # orange
-    "#00FF00",  # lime
-    "#800080",  # purple
-    "#FFC0CB",  # pink
-    "#008080",  # teal
-    "#FF7F50",  # coral
-    "#00FFFF",  # aqua
-    "#8A2BE2",  # violet
-    "#FFD700",  # gold
-    "#7FFF00",  # chartreuse
-    "#FF00FF",  # fuchsia
-    "#A0522D",  # sienna
-    "#40E0D0",  # turquoise
-    "#D2691E",  # chocolate
-    "#DC143C",  # crimson
-    "#FA8072",  # salmon
-    "#DA70D6",  # orchid
-    "#DDA0DD",  # plum
-    "#FFBF00",  # amber
-    "#007FFF",  # azure
-    "#F5F5DC",  # beige
-    "#E6E6FA",  # lavender
-    "#CC7722",  # ochre
-    "#FFDAB9",  # peach
-    "#9B111E",  # ruby
-    "#C0C0C0",  # silver
-    "#D2B48C",  # tan
-    "#F5DEB3",  # wheat
-    "#CD7F32",  # bronze
-    "#3EB489",  # mint
-    "#EAE0C8",  # pearl
-    "#0F52BA",  # sapphire
-    "#F28500",  # tangerine
-    "#50C878",  # emerald
-    "#FF007F",  # rose
-    "#9966CC",  # amethyst
-    "#2A52BE",  # cerulean
-    "#B87333",  # copper
-    "#FFFFF0",  # ivory
-    "#C3B091",  # khaki
-    "#E30B5D",  # raspberry
-    "#D9381E",  # vermilion
-    "#36454F",  # charcoal
-    "#FC8EAC",  # flamingo
-    "#00A36C",  # jade
-    "#FFF44F",  # lemon
-    "#D9E650",  # quartz
-    "#FF6347",  # tomato
-    "#0047AB",  # cobalt
-    "#F4C430",  # saffron
-    "#F9543B",  # zinnia
-    "#808000",  # olive
-    "#800000",  # maroon
-    "#000080",  # navy
-    "#008000",  # green
-    "#0000FF",  # blue
-    "#800000",  # merlot
-    "#4B0082",  # indigo
+# Speaker colors - now we have colors for up to 10 speakers
+SPEAKER_COLORS = [
+    "#FFFF00",  # Yellow
+    "#FF0000",  # Red
+    "#00FF00",  # Green
+    "#00FFFF",  # Cyan
+    "#FF00FF",  # Magenta
+    "#0000FF",  # Blue
+    "#FF8000",  # Orange
+    "#00FF80",  # Spring Green
+    "#8000FF",  # Purple
+    "#FFFFFF",  # White
 ]
 
-two_speaker_threshold = INIT_TWO_SPEAKER_THRESHOLD
-silhouette_diff_threshold = INIT_SILHOUETTE_DIFF_THRESHOLD
+# Color names for display
+SPEAKER_COLOR_NAMES = [
+    "Yellow",
+    "Red",
+    "Green",
+    "Cyan",
+    "Magenta",
+    "Blue",
+    "Orange",
+    "Spring Green",
+    "Purple",
+    "White"
+]
+
+
+class SpeechBrainEncoder:
+    """ECAPA-TDNN encoder from SpeechBrain for speaker embeddings"""
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.model = None
+        self.embedding_dim = 192  # ECAPA-TDNN default dimension
+        self.model_loaded = False
+        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "speechbrain")
+        os.makedirs(self.cache_dir, exist_ok=True)
+    
+    def _download_model(self):
+        """Download pre-trained SpeechBrain ECAPA-TDNN model if not present"""
+        model_url = "https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/resolve/main/embedding_model.ckpt"
+        model_path = os.path.join(self.cache_dir, "embedding_model.ckpt")
+        
+        if not os.path.exists(model_path):
+            print(f"Downloading ECAPA-TDNN model to {model_path}...")
+            urllib.request.urlretrieve(model_url, model_path)
+        
+        return model_path
+    
+    def load_model(self):
+        """Load the ECAPA-TDNN model"""
+        try:
+            # Import SpeechBrain
+            from speechbrain.pretrained import EncoderClassifier
+            
+            # Get model path
+            model_path = self._download_model()
+            
+            # Load the pre-trained model
+            self.model = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=self.cache_dir,
+                run_opts={"device": self.device}
+            )
+            
+            self.model_loaded = True
+            return True
+        except Exception as e:
+            print(f"Error loading ECAPA-TDNN model: {e}")
+            return False
+    
+    def embed_utterance(self, audio, sr=16000):
+        """Extract speaker embedding from audio"""
+        if not self.model_loaded:
+            raise ValueError("Model not loaded. Call load_model() first.")
+        
+        try:
+            # Convert numpy array to torch tensor
+            if isinstance(audio, np.ndarray):
+                waveform = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+            else:
+                waveform = audio.unsqueeze(0)
+            
+            # Ensure sample rate matches model expected rate
+            if sr != 16000:
+                waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=16000)
+            
+            # Get embedding
+            with torch.no_grad():
+                embedding = self.model.encode_batch(waveform)
+                
+            return embedding.squeeze().cpu().numpy()
+        except Exception as e:
+            print(f"Error extracting embedding: {e}")
+            return np.zeros(self.embedding_dim)
+
+
+class AudioProcessor:
+    """Processes audio data to extract speaker embeddings"""
+    def __init__(self, encoder):
+        self.encoder = encoder
+    
+    def extract_embedding(self, audio_int16):
+        try:
+            # Convert int16 audio data to float32
+            float_audio = audio_int16.astype(np.float32) / 32768.0
+            
+            # Normalize if needed
+            if np.abs(float_audio).max() > 1.0:
+                float_audio = float_audio / np.abs(float_audio).max()
+            
+            # Extract embedding using the loaded encoder
+            embedding = self.encoder.embed_utterance(float_audio)
+            
+            return embedding
+        except Exception as e:
+            print(f"Embedding extraction error: {e}")
+            return np.zeros(self.encoder.embedding_dim)
+
+
+class EncoderLoaderThread(QThread):
+    """Thread for loading the speaker encoder model"""
+    model_loaded = pyqtSignal(object)
+    progress_update = pyqtSignal(str)
+    
+    def run(self):
+        try:
+            self.progress_update.emit("Initializing speaker encoder model...")
+            
+            # Check device
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            self.progress_update.emit(f"Using device: {device_str}")
+            
+            # Create SpeechBrain encoder
+            self.progress_update.emit("Loading ECAPA-TDNN model...")
+            encoder = SpeechBrainEncoder(device=device_str)
+            
+            # Load the model
+            success = encoder.load_model()
+            
+            if success:
+                self.progress_update.emit("ECAPA-TDNN model loading complete!")
+                self.model_loaded.emit(encoder)
+            else:
+                self.progress_update.emit("Failed to load ECAPA-TDNN model. Using fallback...")
+                self.model_loaded.emit(None)
+        except Exception as e:
+            self.progress_update.emit(f"Model loading error: {e}")
+            self.model_loaded.emit(None)
+
+
+class SpeakerChangeDetector:
+    """Modified speaker change detector that supports a configurable number of speakers"""
+    def __init__(self, embedding_dim=192, change_threshold=DEFAULT_CHANGE_THRESHOLD, max_speakers=DEFAULT_MAX_SPEAKERS):
+        self.embedding_dim = embedding_dim
+        self.change_threshold = change_threshold
+        self.max_speakers = min(max_speakers, ABSOLUTE_MAX_SPEAKERS)  # Ensure we don't exceed absolute max
+        self.current_speaker = 0  # Initial speaker (0 to max_speakers-1)
+        self.previous_embeddings = []
+        self.last_change_time = time.time()
+        self.mean_embeddings = [None] * self.max_speakers  # Mean embeddings for each speaker
+        self.speaker_embeddings = [[] for _ in range(self.max_speakers)]  # All embeddings for each speaker
+        self.last_similarity = 0.0
+        self.active_speakers = set([0])  # Track which speakers have been detected
+        
+    def set_max_speakers(self, max_speakers):
+        """Update the maximum number of speakers"""
+        new_max = min(max_speakers, ABSOLUTE_MAX_SPEAKERS)
+        
+        # If reducing the number of speakers
+        if new_max < self.max_speakers:
+            # Remove any speakers beyond the new max
+            for speaker_id in list(self.active_speakers):
+                if speaker_id >= new_max:
+                    self.active_speakers.discard(speaker_id)
+            
+            # Ensure current speaker is valid
+            if self.current_speaker >= new_max:
+                self.current_speaker = 0
+        
+        # Expand arrays if increasing max speakers
+        if new_max > self.max_speakers:
+            # Extend mean_embeddings array
+            self.mean_embeddings.extend([None] * (new_max - self.max_speakers))
+            
+            # Extend speaker_embeddings array
+            self.speaker_embeddings.extend([[] for _ in range(new_max - self.max_speakers)])
+        
+        # Truncate arrays if decreasing max speakers
+        else:
+            self.mean_embeddings = self.mean_embeddings[:new_max]
+            self.speaker_embeddings = self.speaker_embeddings[:new_max]
+        
+        self.max_speakers = new_max
+        
+    def set_change_threshold(self, threshold):
+        """Update the threshold for detecting speaker changes"""
+        self.change_threshold = max(0.1, min(threshold, 0.99))
+        
+    def add_embedding(self, embedding, timestamp=None):
+        """Add a new embedding and check if there's a speaker change"""
+        current_time = timestamp or time.time()
+        
+        # Initialize first speaker if no embeddings yet
+        if not self.previous_embeddings:
+            self.previous_embeddings.append(embedding)
+            self.speaker_embeddings[self.current_speaker].append(embedding)
+            if self.mean_embeddings[self.current_speaker] is None:
+                self.mean_embeddings[self.current_speaker] = embedding.copy()
+            return self.current_speaker, 1.0
+        
+        # Calculate similarity with current speaker's mean embedding
+        current_mean = self.mean_embeddings[self.current_speaker]
+        if current_mean is not None:
+            similarity = 1.0 - cosine(embedding, current_mean)
+        else:
+            # If no mean yet, compare with most recent embedding
+            similarity = 1.0 - cosine(embedding, self.previous_embeddings[-1])
+        
+        self.last_similarity = similarity
+        
+        # Decide if this is a speaker change
+        time_since_last_change = current_time - self.last_change_time
+        is_speaker_change = False
+        
+        # Only consider change if minimum time has passed since last change
+        if time_since_last_change >= MIN_SEGMENT_DURATION:
+            # Check similarity against threshold
+            if similarity < self.change_threshold:
+                # Compare with all other speakers' means if available
+                best_speaker = self.current_speaker
+                best_similarity = similarity
+                
+                # Check each active speaker
+                for speaker_id in range(self.max_speakers):
+                    if speaker_id == self.current_speaker:
+                        continue
+                        
+                    speaker_mean = self.mean_embeddings[speaker_id]
+                    
+                    if speaker_mean is not None:
+                        # Calculate similarity with this speaker
+                        speaker_similarity = 1.0 - cosine(embedding, speaker_mean)
+                        
+                        # If more similar to this speaker, update best match
+                        if speaker_similarity > best_similarity:
+                            best_similarity = speaker_similarity
+                            best_speaker = speaker_id
+                
+                # If best match is different from current speaker, change speaker
+                if best_speaker != self.current_speaker:
+                    is_speaker_change = True
+                    self.current_speaker = best_speaker
+                # If no good match with existing speakers and we haven't used all speakers yet
+                elif len(self.active_speakers) < self.max_speakers:
+                    # Find the next unused speaker ID
+                    for new_id in range(self.max_speakers):
+                        if new_id not in self.active_speakers:
+                            is_speaker_change = True
+                            self.current_speaker = new_id
+                            self.active_speakers.add(new_id)
+                            break
+        
+        # Handle speaker change
+        if is_speaker_change:
+            self.last_change_time = current_time
+        
+        # Update embeddings
+        self.previous_embeddings.append(embedding)
+        if len(self.previous_embeddings) > EMBEDDING_HISTORY_SIZE:
+            self.previous_embeddings.pop(0)
+        
+        # Update current speaker's embeddings and mean
+        self.speaker_embeddings[self.current_speaker].append(embedding)
+        self.active_speakers.add(self.current_speaker)
+        
+        if len(self.speaker_embeddings[self.current_speaker]) > 30:  # Limit history size
+            self.speaker_embeddings[self.current_speaker] = self.speaker_embeddings[self.current_speaker][-30:]
+            
+        # Update mean embedding for current speaker
+        if self.speaker_embeddings[self.current_speaker]:
+            self.mean_embeddings[self.current_speaker] = np.mean(
+                self.speaker_embeddings[self.current_speaker], axis=0
+            )
+        
+        return self.current_speaker, similarity
+    
+    def get_color_for_speaker(self, speaker_id):
+        """Return color for speaker ID (0 to max_speakers-1)"""
+        if 0 <= speaker_id < len(SPEAKER_COLORS):
+            return SPEAKER_COLORS[speaker_id]
+        return "#FFFFFF"  # Default to white if out of range
+    
+    def get_status_info(self):
+        """Return status information about the speaker change detector"""
+        speaker_counts = [len(self.speaker_embeddings[i]) for i in range(self.max_speakers)]
+        
+        return {
+            "current_speaker": self.current_speaker,
+            "speaker_counts": speaker_counts,
+            "active_speakers": len(self.active_speakers),
+            "max_speakers": self.max_speakers,
+            "last_similarity": self.last_similarity,
+            "threshold": self.change_threshold
+        }
+
+
+class TextUpdateThread(QThread):
+    text_update_signal = pyqtSignal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        self.text_update_signal.emit(self.text)
+
+
+class SentenceWorker(QThread):
+    sentence_update_signal = pyqtSignal(list, list)
+    status_signal = pyqtSignal(str)
+
+    def __init__(self, queue, encoder, change_threshold=DEFAULT_CHANGE_THRESHOLD, max_speakers=DEFAULT_MAX_SPEAKERS):
+        super().__init__()
+        self.queue = queue
+        self.encoder = encoder
+        self._is_running = True
+        self.full_sentences = []
+        self.sentence_speakers = []
+        self.change_threshold = change_threshold
+        self.max_speakers = max_speakers
+        
+        # Initialize audio processor for embedding extraction
+        self.audio_processor = AudioProcessor(self.encoder)
+        
+        # Initialize speaker change detector
+        self.speaker_detector = SpeakerChangeDetector(
+            embedding_dim=self.encoder.embedding_dim,
+            change_threshold=self.change_threshold,
+            max_speakers=self.max_speakers
+        )
+        
+        # Setup monitoring timer
+        self.monitoring_timer = QTimer()
+        self.monitoring_timer.timeout.connect(self.report_status)
+        self.monitoring_timer.start(2000)  # Report every 2 seconds
+    
+    def set_change_threshold(self, threshold):
+        """Update change detection threshold"""
+        self.change_threshold = threshold
+        self.speaker_detector.set_change_threshold(threshold)
+        
+    def set_max_speakers(self, max_speakers):
+        """Update maximum number of speakers"""
+        self.max_speakers = max_speakers
+        self.speaker_detector.set_max_speakers(max_speakers)
+    
+    def run(self):
+        """Main worker thread loop"""
+        while self._is_running:
+            try:
+                text, bytes = self.queue.get(timeout=1)
+                self.process_item(text, bytes)
+            except queue.Empty:
+                continue
+    
+    def report_status(self):
+        """Report status information"""
+        # Get status information from speaker detector
+        status = self.speaker_detector.get_status_info()
+        
+        # Prepare status message with information for all speakers
+        status_text = f"Current speaker: {status['current_speaker'] + 1}\n"
+        status_text += f"Active speakers: {status['active_speakers']} of {status['max_speakers']}\n"
+        
+        # Show segment counts for each speaker
+        for i in range(status['max_speakers']):
+            if i < len(SPEAKER_COLOR_NAMES):
+                color_name = SPEAKER_COLOR_NAMES[i]
+            else:
+                color_name = f"Speaker {i+1}"
+            status_text += f"Speaker {i+1} ({color_name}) segments: {status['speaker_counts'][i]}\n"
+        
+        status_text += f"Last similarity score: {status['last_similarity']:.3f}\n"
+        status_text += f"Change threshold: {status['threshold']:.2f}\n"
+        status_text += f"Total sentences: {len(self.full_sentences)}"
+        
+        # Send to UI
+        self.status_signal.emit(status_text)
+    
+    def process_item(self, text, bytes):
+        """Process a new text-audio pair"""
+        # Convert audio data to int16
+        audio_int16 = np.int16(bytes * 32767)
+        
+        # Extract speaker embedding
+        speaker_embedding = self.audio_processor.extract_embedding(audio_int16)
+        
+        # Store sentence and embedding
+        self.full_sentences.append((text, speaker_embedding))
+        
+        # Fill in any missing speaker assignments
+        if len(self.sentence_speakers) < len(self.full_sentences) - 1:
+            while len(self.sentence_speakers) < len(self.full_sentences) - 1:
+                self.sentence_speakers.append(0)  # Default to first speaker
+        
+        # Detect speaker changes
+        speaker_id, similarity = self.speaker_detector.add_embedding(speaker_embedding)
+        self.sentence_speakers.append(speaker_id)
+        
+        # Send updated data to UI
+        self.sentence_update_signal.emit(self.full_sentences, self.sentence_speakers)
+    
+    def stop(self):
+        """Stop the worker thread"""
+        self._is_running = False
+        if self.monitoring_timer.isActive():
+            self.monitoring_timer.stop()
+
+
+class RecordingThread(QThread):
+    def __init__(self, recorder):
+        super().__init__()
+        self.recorder = recorder
+        self._is_running = True
+        
+        # Determine input source
+        if USE_MICROPHONE:
+            self.device_id = str(sc.default_microphone().name)
+            self.include_loopback = False
+        else:
+            self.device_id = str(sc.default_speaker().name)
+            self.include_loopback = True
+
+    def updateDevice(self, device_id, include_loopback):
+        self.device_id = device_id
+        self.include_loopback = include_loopback
+
+    def run(self):
+        while self._is_running:
+            try:
+                with sc.get_microphone(id=self.device_id, include_loopback=self.include_loopback).recorder(
+                    samplerate=SAMPLE_RATE, blocksize=BUFFER_SIZE
+                ) as mic:
+                    # Process audio chunks while device hasn't changed
+                    current_device = self.device_id
+                    current_loopback = self.include_loopback
+                    
+                    while self._is_running and current_device == self.device_id and current_loopback == self.include_loopback:
+                        # Record audio chunk
+                        audio_data = mic.record(numframes=BUFFER_SIZE)
+                        
+                        # Convert stereo to mono if needed
+                        if audio_data.shape[1] > 1 and CHANNELS == 1:
+                            audio_data = audio_data[:, 0]
+                        
+                        # Convert to int16
+                        audio_int16 = (audio_data.flatten() * 32767).astype(np.int16)
+                        
+                        # Feed to recorder
+                        audio_bytes = audio_int16.tobytes()
+                        self.recorder.feed_audio(audio_bytes)
+                    
+            except Exception as e:
+                print(f"Recording error: {e}")
+                # Wait before retry on error
+                time.sleep(1)
+
+    def stop(self):
+        self._is_running = False
 
 
 class TextRetrievalThread(QThread):
@@ -119,7 +524,6 @@ class TextRetrievalThread(QThread):
         self.textRetrievedLive.emit(text)
 
     def run(self):
-        print("Emitted Starting recorder")
         recorder_config = {
             'spinner': False,
             'use_microphone': False,
@@ -152,250 +556,73 @@ class TextRetrievalThread(QThread):
             self.recorder.text(process_text)
 
 
-class TextUpdateThread(QThread):
-    text_update_signal = pyqtSignal(str)
-
-    def __init__(self, text):
-        super().__init__()
-        self.text = text
-
-    def run(self):
-        self.text_update_signal.emit(self.text)
-
-
-class RecordingThread(QThread):
-    def __init__(self, recorder):
-        super().__init__()
-
-        self.audio = pyaudio.PyAudio()
-
-        def find_stereo_mix_index():
-            devices = ""
-            for i in range(self.audio.get_device_count()):
-                dev = self.audio.get_device_info_by_index(i)
-                devices += f"{dev['index']}: {dev['name']} "
-                f"(hostApi: {dev['hostApi']})\n"
-
-                if (LOOPBACK_DEVICE_NAME in dev['name'].lower()
-                        and dev['hostApi'] == LOOPBACK_DEVICE_HOST_API):
-                    return dev['index'], devices
-
-            return None, devices
-
-        # Selecting the input device based on USE_MICROPHONE flag
-        if USE_MICROPHONE:
-            input_device_index = 0  # Default input device (microphone)
-        else:
-            input_device_index, _ = find_stereo_mix_index()
-            if input_device_index is None:
-                print("Loopback / Stereo Mix device not found")
-                print("Available devices:\n", devices)
-                self.audio.terminate()
-                exit()
-            else:
-                print(f"Stereo Mix device found at index: {input_device_index}")
-
-        self.stream = self.audio.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=BUFFER_SIZE,
-            input_device_index=input_device_index)
-        self.recorder = recorder
-        self._is_running = True
-
-    def run(self):
-        while self._is_running:
-            data = self.stream.read(BUFFER_SIZE, exception_on_overflow=False)
-            self.recorder.feed_audio(data)
-
-    def stop(self):
-        self._is_running = False
-        self.stream.stop_stream()
-        self.stream.close()
-        self.audio.terminate()
-
-
-class SentenceWorker(QThread):
-    sentence_update_signal = pyqtSignal(list, list)
-
-    def __init__(self, queue, tts_model):
-        super().__init__()
-        self.queue = queue
-        self.tts = tts_model
-        self._is_running = True
-        self.full_sentences = []
-        self.sentence_speakers = []
-        self.speaker_index = 0
-        self.speakers = []
-
-    def run(self):
-        while self._is_running:
-            try:
-                text, bytes = self.queue.get(timeout=1)
-                self.process_item(text, bytes)
-            except queue.Empty:
-                continue
-
-    # Safety check using KMeans for initial speaker detection
-    def determine_optimal_cluster_count(self, embeddings_scaled):
-        num_embeddings = len(embeddings_scaled)
-        if num_embeddings <= 1:
-            # Only one embedding, so only one speaker
-            return 1
-        
-        # Determine single or multiple speakers
-        # K-means Clustering with k=2
-        kmeans = KMeans(n_clusters=2, random_state=0).fit(embeddings_scaled)
-        distances = kmeans.transform(embeddings_scaled)
-        avg_distance = np.mean(np.min(distances, axis=1))
-        distance_threshold = two_speaker_threshold  # Threshold to decide if we have one or multiple speakers
-
-        # Check if the average distance is below threshold for single speaker
-        if avg_distance < distance_threshold:
-            print(f"Single Speaker: low embedding distance: {avg_distance} < {distance_threshold}.")
-            return 1
-
-        # Hierarchical Clustering for multiple speakers
-        max_clusters = min(10, num_embeddings)
-        range_clusters = range(2, max_clusters + 1)
-        silhouette_scores = []
-
-        for n_clusters in range_clusters:
-            hc = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
-            cluster_labels = hc.fit_predict(embeddings_scaled)
-
-            unique_labels = set(cluster_labels)
-            if 1 < len(unique_labels) < len(embeddings_scaled):
-                silhouette_avg = silhouette_score(embeddings_scaled, cluster_labels)
-                silhouette_scores.append(silhouette_avg)
-            else:
-                print(f"Inappropriate number of clusters: {len(unique_labels)}.")
-                silhouette_scores.append(-1)
-
-
-        # Find the optimal number of clusters
-        # It's the point before the silhouette score starts to decrease significantly
-        optimal_cluster_count = 2
-        for i in range(1, len(silhouette_scores)):
-            if silhouette_scores[i] < silhouette_scores[i-1] + silhouette_diff_threshold:
-                optimal_cluster_count = range_clusters[i-1]
-                break
-
-        return optimal_cluster_count
-
-    def process_speakers(self):
-        embeddings = [speaker_embedding for _, speaker_embedding in self.full_sentences]
-
-        # Standard scaling
-        embeddings_array = np.array(embeddings)
-        scaler = StandardScaler()
-        embeddings_scaled = scaler.fit_transform(embeddings_array)
-
-        optimal_cluster_count = self.determine_optimal_cluster_count(embeddings_scaled)
-
-        if optimal_cluster_count == 1:
-            self.sentence_speakers = [0] * len(self.full_sentences)
-        else:
-            self.sentence_speakers = []
-
-            # Determine clusters
-            hc = AgglomerativeClustering(n_clusters=optimal_cluster_count, linkage='ward')
-            clusters = hc.fit_predict(embeddings_scaled)
-
-            # Assign sentences to clusters
-            # Create a mapping from old to new cluster indices
-            cluster_mapping = {}
-            new_index = 0
-            for cluster in clusters:
-                if cluster not in cluster_mapping:
-                    cluster_mapping[cluster] = new_index
-                    new_index += 1
-
-            # Assign sentences to clusters with new indices
-            for cluster in clusters:
-                self.sentence_speakers.append(cluster_mapping[cluster])
-
-    def process_item(self, text, bytes):
-        audio_int16 = np.int16(bytes * 32767)
-
-        tempfile = "output.wav"
-        with wave.open(tempfile, 'w') as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16000)
-            wav_file.writeframes(audio_int16.tobytes())
-
-        for tries in range(3):
-            try:
-                _, speaker_embedding = self.tts.get_conditioning_latents(
-                    audio_path=tempfile,
-                    gpt_cond_len=30,
-                    max_ref_length=60)
-                speaker_embedding = \
-                    speaker_embedding.view(-1).cpu().detach().numpy()
-                break
-            except Exception as e:
-                print(f"Error in try {tries}: {e}")
-                speaker_embedding = np.zeros(512)
-
-        self.full_sentences.append((text, speaker_embedding))
-        self.process_speakers()
-        self.sentence_update_signal.emit(self.full_sentences, self.sentence_speakers)
-
-    def stop(self):
-        self._is_running = False
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Realtime Speaker Diarization")
+        self.setWindowTitle("Real-time Speaker Change Detection")
 
-        self.tts = None
+        self.encoder = None
         self.initialized = False
         self.displayed_text = ""
         self.last_realtime_text = ""
         self.full_sentences = []
         self.sentence_speakers = []
-        self.speaker_index = 0
         self.pending_sentences = []
-        # self.speakers = []
         self.queue = queue.Queue()
+        self.recording_thread = None
+        self.change_threshold = DEFAULT_CHANGE_THRESHOLD
+        self.max_speakers = DEFAULT_MAX_SPEAKERS
 
-        # Create the main layout as horizontal
+        # Create main horizontal layout
         self.mainLayout = QHBoxLayout()
 
-        # Add the text edit to the main layout
+        # Add text edit area to main layout
         self.text_edit = QTextEdit(self)
         self.mainLayout.addWidget(self.text_edit, 1)
 
-        # Create the right layout for controls and add them to the main layout
+        # Create right layout for controls
         self.rightLayout = QVBoxLayout()
-        self.rightLayout.setAlignment(Qt.AlignmentFlag.AlignTop)  # Align controls to the top
+        self.rightLayout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        # Create all controls
         self.create_controls()
 
-        # Create a container for the right layout
+        # Create container for right layout
         self.rightContainer = QWidget()
         self.rightContainer.setLayout(self.rightLayout)
-        self.mainLayout.addWidget(self.rightContainer, 0)  # Controls get the space they need
+        self.mainLayout.addWidget(self.rightContainer, 0)
 
-        # Set the main layout to the central widget
+        # Set main layout as central widget
         self.centralWidget = QWidget()
         self.centralWidget.setLayout(self.mainLayout)
         self.setCentralWidget(self.centralWidget)
 
         self.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #555;
+                border-radius: 3px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: #ddd;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                padding: 0 5px;
+            }
             QLabel {
                 color: #ddd;
             }
-            QDoubleSpinBox {
-                background: #333;
+            QPushButton {
+                background: #444;
                 color: #ddd;
                 border: 1px solid #555;
-                margin-bottom: 22px;
+                padding: 5px;
+                margin-bottom: 10px;
+            }
+            QPushButton:hover {
+                background: #555;
             }
             QTextEdit {
                 background-color: #1e1e1e;
@@ -403,54 +630,142 @@ class MainWindow(QMainWindow):
                 font-family: 'Arial';
                 font-size: 16pt;
             }
+            QSlider {
+                height: 30px;
+            }
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: #333;
+                margin: 2px 0;
+            }
+            QSlider::handle:horizontal {
+                background: #666;
+                border: 1px solid #777;
+                width: 18px;
+                margin: -8px 0;
+                border-radius: 9px;
+            }
         """)
 
     def create_controls(self):
-
-        self.two_speaker_threshold_desc = QLabel("For one or two speakers differentiation:")
-        self.two_speaker_threshold_label = QLabel("Two cluster similarity (0.1-100)")
-        self.two_speaker_threshold_spinbox = QDoubleSpinBox()
-        self.two_speaker_threshold_spinbox.setRange(0.1, 100)
-        self.two_speaker_threshold_spinbox.setSingleStep(0.1)
-        self.two_speaker_threshold_spinbox.setValue(two_speaker_threshold)
-        self.two_speaker_threshold_spinbox.valueChanged.connect(self.update_two_speaker_threshold)
-
-        self.silhouette_diff_threshold_desc = QLabel("For more than two speakers differentiation:")
-        self.silhouette_diff_threshold_label = QLabel("Silhouette similarity (0.001-1)")
-        self.silhouette_diff_threshold_spinbox = QDoubleSpinBox()
-        self.silhouette_diff_threshold_spinbox.setDecimals(5)
-        self.silhouette_diff_threshold_spinbox.setRange(0, 0.01)
-        self.silhouette_diff_threshold_spinbox.setSingleStep(0.00001)
-        self.silhouette_diff_threshold_spinbox.setValue(silhouette_diff_threshold)
-        self.silhouette_diff_threshold_spinbox.valueChanged.connect(self.update_silhouette_diff_threshold)
-
-        self.two_speaker_threshold_label.setToolTip(
-            "Adjust this threshold to control how the program differentiates between one or two speakers. "
-            "Lower values mean only highly distinct voices are considered separate speakers. "
-            "Higher values allow more leniency in identifying different speakers."
+        # Speaker change threshold control
+        self.threshold_group = QGroupBox("Speaker Change Sensitivity")
+        threshold_layout = QVBoxLayout()
+        
+        self.threshold_label = QLabel(f"Change threshold: {self.change_threshold:.2f}")
+        threshold_layout.addWidget(self.threshold_label)
+        
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.threshold_slider.setMinimum(10)
+        self.threshold_slider.setMaximum(95)
+        self.threshold_slider.setValue(int(self.change_threshold * 100))
+        self.threshold_slider.valueChanged.connect(self.update_threshold)
+        threshold_layout.addWidget(self.threshold_slider)
+        
+        self.threshold_explanation = QLabel(
+            "If the speakers have similar voices, it would be better to set it above 0.5, and if they have different voices, it would be lower."
         )
-
-        self.silhouette_diff_threshold_spinbox.setToolTip(
-            "This value determines the required increase in similarity score to identify an additional speaker. "
-            "Lower values make it easier to identify more speakers. "
-            "Higher values prevent too many speakers from being identified, especially in noisy conditions."
+        self.threshold_explanation.setWordWrap(True)
+        threshold_layout.addWidget(self.threshold_explanation)
+        
+        self.threshold_group.setLayout(threshold_layout)
+        self.rightLayout.addWidget(self.threshold_group)
+        
+        # Max speakers control
+        self.max_speakers_group = QGroupBox("Maximum Number of Speakers")
+        max_speakers_layout = QVBoxLayout()
+        
+        self.max_speakers_label = QLabel(f"Max speakers: {self.max_speakers}")
+        max_speakers_layout.addWidget(self.max_speakers_label)
+        
+        self.max_speakers_spinbox = QSpinBox()
+        self.max_speakers_spinbox.setMinimum(2)
+        self.max_speakers_spinbox.setMaximum(ABSOLUTE_MAX_SPEAKERS)
+        self.max_speakers_spinbox.setValue(self.max_speakers)
+        self.max_speakers_spinbox.valueChanged.connect(self.update_max_speakers)
+        max_speakers_layout.addWidget(self.max_speakers_spinbox)
+        
+        self.max_speakers_explanation = QLabel(
+            f"You can set between 2 and {ABSOLUTE_MAX_SPEAKERS} speakers.\n"
+            "Changes will apply immediately."
         )
+        self.max_speakers_explanation.setWordWrap(True)
+        max_speakers_layout.addWidget(self.max_speakers_explanation)
+        
+        self.max_speakers_group.setLayout(max_speakers_layout)
+        self.rightLayout.addWidget(self.max_speakers_group)
+        
+        # Speaker color legend - dynamic based on max speakers
+        self.legend_group = QGroupBox("Speaker Colors")
+        self.legend_layout = QVBoxLayout()
+        
+        # Create speaker labels dynamically
+        self.speaker_labels = []
+        for i in range(ABSOLUTE_MAX_SPEAKERS):
+            color = SPEAKER_COLORS[i]
+            color_name = SPEAKER_COLOR_NAMES[i]
+            label = QLabel(f"Speaker {i+1} ({color_name}): <span style='color:{color};'>■■■■■</span>")
+            self.speaker_labels.append(label)
+            if i < self.max_speakers:
+                self.legend_layout.addWidget(label)
+        
+        self.legend_group.setLayout(self.legend_layout)
+        self.rightLayout.addWidget(self.legend_group)
+        
+        # Status display area
+        self.status_group = QGroupBox("Status")
+        status_layout = QVBoxLayout()
+        
+        self.status_label = QLabel("Status information will be displayed here.")
+        self.status_label.setWordWrap(True)
+        status_layout.addWidget(self.status_label)
+        
+        self.status_group.setLayout(status_layout)
+        self.rightLayout.addWidget(self.status_group)
 
-        # Add the controls to the right layout
-        self.rightLayout.addWidget(self.two_speaker_threshold_desc)
-        self.rightLayout.addWidget(self.two_speaker_threshold_label)
-        self.rightLayout.addWidget(self.two_speaker_threshold_spinbox)
-
-        self.rightLayout.addWidget(self.silhouette_diff_threshold_desc)
-        self.rightLayout.addWidget(self.silhouette_diff_threshold_label)
-        self.rightLayout.addWidget(self.silhouette_diff_threshold_spinbox)
-
-        self.clear_button = QPushButton("Clear")
+        # Clear button
+        self.clear_button = QPushButton("Clear Conversation")
         self.clear_button.clicked.connect(self.clear_state)
+        self.clear_button.setEnabled(False)
         self.rightLayout.addWidget(self.clear_button)
+    
+    def update_threshold(self, value):
+        """Update speaker change detection threshold"""
+        threshold = value / 100.0
+        self.change_threshold = threshold
+        self.threshold_label.setText(f"Change threshold: {threshold:.2f}")
+        
+        # Update in worker if it exists
+        if hasattr(self, 'worker_thread'):
+            self.worker_thread.set_change_threshold(threshold)
+            
+    def update_max_speakers(self, value):
+        """Update maximum number of speakers"""
+        self.max_speakers = value
+        self.max_speakers_label.setText(f"Max speakers: {value}")
+        
+        # Update visible speaker labels
+        self.update_speaker_labels()
+        
+        # Update in worker if it exists
+        if hasattr(self, 'worker_thread'):
+            self.worker_thread.set_max_speakers(value)
+    
+    def update_speaker_labels(self):
+        """Update which speaker labels are visible based on max_speakers"""
+        # Clear all labels first
+        for i in range(len(self.speaker_labels)):
+            label = self.speaker_labels[i]
+            if label.parent():
+                self.legend_layout.removeWidget(label)
+                label.setParent(None)
+        
+        # Add only the labels for the current max_speakers
+        for i in range(min(self.max_speakers, len(self.speaker_labels))):
+            self.legend_layout.addWidget(self.speaker_labels[i])
 
     def clear_state(self):
-        # Clear text edit
+        # Clear text edit area
         self.text_edit.clear()
 
         # Reset state variables
@@ -459,28 +774,22 @@ class MainWindow(QMainWindow):
         self.full_sentences = []
         self.sentence_speakers = []
         self.pending_sentences = []
-        self.worker_thread.full_sentences = []
-        self.worker_thread.sentence_speakers = []
-        self.worker_thread.speakers = []
+        
+        if hasattr(self, 'worker_thread'):
+            self.worker_thread.full_sentences = []
+            self.worker_thread.sentence_speakers = []
+            # Reset speaker detector with current threshold and max_speakers
+            self.worker_thread.speaker_detector = SpeakerChangeDetector(
+                embedding_dim=self.encoder.embedding_dim,
+                change_threshold=self.change_threshold,
+                max_speakers=self.max_speakers
+            )
 
-        # Optional: Provide a message in text edit to indicate clearing
-        self.text_edit.setHtml("<i>All cleared. Ready for new input.</i>")
-
-    def update_ui(self):
-        self.worker_thread.process_speakers()
-        self.sentence_updated(
-            self.worker_thread.full_sentences,
-            self.worker_thread.sentence_speakers)
-
-    def update_two_speaker_threshold(self, value):
-        global two_speaker_threshold
-        two_speaker_threshold = value
-        self.update_ui()
-
-    def update_silhouette_diff_threshold(self, value):
-        global silhouette_diff_threshold
-        silhouette_diff_threshold = value
-        self.update_ui()
+        # Display message
+        self.text_edit.setHtml("<i>All content cleared. Waiting for new input...</i>")
+    
+    def update_status(self, status_text):
+        self.status_label.setText(status_text)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -488,7 +797,7 @@ class MainWindow(QMainWindow):
             if not self.initialized:
                 self.initialized = True
                 self.resize(1200, 800)
-                self.update_text("<i>Please wait until app is loaded</i>")
+                self.update_text("<i>Initializing application...</i>")
 
                 QTimer.singleShot(500, self.init)
 
@@ -513,23 +822,18 @@ class MainWindow(QMainWindow):
             else:
                 self.text_retrieval_thread.recorder.post_speech_silence_duration = SILENCE_THRESHS[1]
 
-            self.last_realtime_text = text
-
         self.text_detected(text)
 
     def text_detected(self, text):
-
         try:
             sentences_with_style = []
             for i, sentence in enumerate(self.full_sentences):
-                sentence_text, speaker_embedding = sentence
-                sentence_tshort = sentence_text[:40]
+                sentence_text, _ = sentence
                 if i >= len(self.sentence_speakers):
-                    print(f"Index {i} out of range")
-                    color = "#FFFFFF"
+                    color = "#FFFFFF"  # Default white
                 else:
-                    speaker_index = self.sentence_speakers[i]
-                    color = COLOR_TABLE_HEX[speaker_index % len(COLOR_TABLE_HEX)]
+                    speaker_id = self.sentence_speakers[i]
+                    color = self.worker_thread.speaker_detector.get_color_for_speaker(speaker_id)
 
                 sentences_with_style.append(
                     f'<span style="color:{color};">{sentence_text}</span>')
@@ -546,7 +850,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error: {e}")
 
-
     def process_final(self, text, bytes):
         text = text.strip()
         if text:
@@ -556,26 +859,51 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"Error: {e}")
 
-    def recording_thread(self, stream):
-        while True:
-            data = stream.read(BUFFER_SIZE)
-            self.text_retrieval_thread.recorder.feed(data)
-
     def capture_output_and_feed_to_recorder(self):
-        self.recording_thread = RecordingThread(
-            self.text_retrieval_thread.recorder)
+        # Use default device settings
+        device_id = str(sc.default_speaker().name)
+        include_loopback = True
+        
+        self.recording_thread = RecordingThread(self.text_retrieval_thread.recorder)
+        # Update with current device settings
+        self.recording_thread.updateDevice(device_id, include_loopback)
         self.recording_thread.start()
 
     def recorder_ready(self):
-        print("Recorder ready")
-        self.update_text("<i>Ready to record</i>")
-
+        self.update_text("<i>Recording ready</i>")
         self.capture_output_and_feed_to_recorder()
 
     def init(self):
-        self.start_tts()
+        self.update_text("<i>Loading ECAPA-TDNN model... Please wait.</i>")
+        
+        # Start model loading in background thread
+        self.start_encoder()
 
-        print("Starting recorder thread")
+    def update_loading_status(self, message):
+        self.update_text(f"<i>{message}</i>")
+
+    def start_encoder(self):
+        # Create and start encoder loader thread
+        self.encoder_loader_thread = EncoderLoaderThread()
+        self.encoder_loader_thread.model_loaded.connect(self.on_model_loaded)
+        self.encoder_loader_thread.progress_update.connect(self.update_loading_status)
+        self.encoder_loader_thread.start()
+
+    def on_model_loaded(self, encoder):
+        # Store loaded encoder model
+        self.encoder = encoder
+        
+        if self.encoder is None:
+            self.update_text("<i>Failed to load ECAPA-TDNN model. Please check your configuration.</i>")
+            return
+        
+        # Enable all controls after model is loaded
+        self.clear_button.setEnabled(True)
+        self.threshold_slider.setEnabled(True)
+        
+        # Continue initialization
+        self.update_text("<i>ECAPA-TDNN model loaded. Starting recorder...</i>")
+        
         self.text_retrieval_thread = TextRetrievalThread()
         self.text_retrieval_thread.recorderStarted.connect(
             self.recorder_ready)
@@ -584,40 +912,28 @@ class MainWindow(QMainWindow):
         self.text_retrieval_thread.textRetrievedFinal.connect(
             self.process_final)
         self.text_retrieval_thread.start()
-
-        self.worker_thread = SentenceWorker(self.queue, self.tts)
+        
+        self.worker_thread = SentenceWorker(
+            self.queue, 
+            self.encoder, 
+            change_threshold=self.change_threshold,
+            max_speakers=self.max_speakers
+        )
         self.worker_thread.sentence_update_signal.connect(
             self.sentence_updated)
+        self.worker_thread.status_signal.connect(
+            self.update_status)
         self.worker_thread.start()
 
-    def sentence_updated(self, full_sentences,sentence_speakers):
+    def sentence_updated(self, full_sentences, sentence_speakers):
         self.pending_text = ""
         self.full_sentences = full_sentences
-        # self.speakers = speakers
         self.sentence_speakers = sentence_speakers
         for sentence in self.full_sentences:
-            sentence_text, speaker_embedding = sentence
+            sentence_text, _ = sentence
             if sentence_text in self.pending_sentences:
                 self.pending_sentences.remove(sentence_text)
         self.text_detected("")
-
-    def start_tts(self):
-        print("Loading TTS model")
-        device = torch.device("cuda")
-        local_models_path = os.environ.get("COQUI_MODEL_PATH")
-        checkpoint = os.path.join(local_models_path, "v2.0.2")
-        config = load_config((os.path.join(checkpoint, "config.json")))
-        self.tts = setup_tts_model(config)
-        self.tts.load_checkpoint(
-            config,
-            checkpoint_dir=checkpoint,
-            checkpoint_path=None,
-            vocab_path=None,
-            eval=True,
-            use_deepspeed=False,
-        )
-        self.tts.to(device)
-        print("TTS model loaded")
 
     def set_text(self, text):
         self.update_thread = TextUpdateThread(text)
